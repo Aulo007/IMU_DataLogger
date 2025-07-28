@@ -23,7 +23,20 @@ static bool logger_enabled;
 static const uint32_t period = 1000;
 static absolute_time_t next_log_time;
 
-static char filename[20] = "adc_data1.csv";
+volatile bool cartao_montado = false;
+volatile bool capturando_dados = false;
+
+static FIL g_log_file;
+static volatile bool g_log_ativo = false; // 'volatile' é importante para flags usadas em interrupções
+static volatile bool g_dados_prontos_para_gravar = false;
+
+// Estrutura para armazenar a média final que será gravada no arquivo
+static int16_t g_dados_medios[7]; // ax, ay, az, gx, gy, gz, temp
+
+// Estrutura do nosso temporizador
+static repeating_timer_t g_repeating_timer;
+
+static char filename[20] = "adc_data8.csv";
 
 static sd_card_t *sd_get_by_name(const char *const name)
 {
@@ -139,6 +152,7 @@ static void run_mount()
     sd_card_t *pSD = sd_get_by_name(arg1);
     myASSERT(pSD);
     pSD->mounted = true;
+    cartao_montado = true;
     printf("Processo de montagem do SD ( %s ) concluído\n", pSD->pcName);
 }
 static void run_unmount()
@@ -162,6 +176,7 @@ static void run_unmount()
     myASSERT(pSD);
     pSD->mounted = false;
     pSD->m_Status |= STA_NOINIT; // in case medium is removed
+    cartao_montado = false;
     printf("SD ( %s ) desmontado\n", pSD->pcName);
 }
 static void run_getfree()
@@ -321,58 +336,111 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp)
     *temp = buffer[0] << 8 | buffer[1];
 }
 
-// Função para capturar dados do ADC e salvar no arquivo *.txt
-
-bool gravar_dados_imu(const char *filename, uint32_t num_amostras, uint32_t intervalo_ms)
+// Funções para capturar log de forma contínua
+// Esta função é chamada pela interrupção do timer a cada 10ms.
+bool timer_callback(struct repeating_timer *t)
 {
-    FIL fil;
-    FRESULT fr;
+    // Se o log não estiver ativo, simplesmente para o timer e sai.
+    if (!g_log_ativo)
+    {
+        g_dados_prontos_para_gravar = false;
+        return false; // Retornar false cancela o timer
+    }
 
-    // 1. Abrir o arquivo no modo de escrita (cria um novo arquivo ou sobrescreve o existente)
-    fr = f_open(&fil, filename, FA_CREATE_ALWAYS | FA_WRITE);
+    // Variáveis para acumular as 100 amostras. Usamos 32-bit para não estourar.
+    static int32_t acc_accum[3], gyro_accum[3], temp_accum;
+    static int sample_count = 0;
+
+    // Variáveis temporárias para a leitura do sensor
+    int16_t accel[3], gyro[3], temp_raw;
+    mpu6050_read_raw(accel, gyro, &temp_raw);
+
+    // Acumula os valores
+    for (int i = 0; i < 3; i++)
+    {
+        acc_accum[i] += accel[i];
+        gyro_accum[i] += gyro[i];
+    }
+    temp_accum += temp_raw;
+    sample_count++;
+
+    if (sample_count >= 100)
+    {
+        // Calcula a média de cada sensor
+        g_dados_medios[0] = acc_accum[0] / 100;
+        g_dados_medios[1] = acc_accum[1] / 100;
+        g_dados_medios[2] = acc_accum[2] / 100;
+        g_dados_medios[3] = gyro_accum[0] / 100;
+        g_dados_medios[4] = gyro_accum[1] / 100;
+        g_dados_medios[5] = gyro_accum[2] / 100;
+        g_dados_medios[6] = temp_accum / 100;
+
+        // Reseta os acumuladores e o contador para o próximo segundo
+        for (int i = 0; i < 3; i++)
+        {
+            acc_accum[i] = 0;
+            gyro_accum[i] = 0;
+        }
+        temp_accum = 0;
+        sample_count = 0;
+
+        // Sinaliza para o loop principal que há dados prontos para serem gravados no arquivo
+        g_dados_prontos_para_gravar = true;
+    }
+
+    return true; // Retornar true mantém o timer ativo
+}
+
+// Função para INICIAR o processo de log
+void iniciar_log_robusto()
+{
+    if (g_log_ativo)
+    {
+        printf("Log já está ativo!\n");
+        return;
+    }
+
+    // Abre o arquivo para adicionar dados no final
+    FRESULT fr = f_open(&g_log_file, filename, FA_OPEN_APPEND | FA_WRITE);
     if (fr != FR_OK)
     {
         printf("ERRO: Nao foi possivel abrir o arquivo '%s' (%s)\n", filename, FRESULT_str(fr));
-        return false;
+        return;
     }
 
-    // 2. Escrever o cabeçalho do arquivo CSV
-    // Usamos ';' como delimitador, conforme solicitado.
-    f_printf(&fil, "timestamp_us;ax;ay;az;gx;gy;gz;temp_raw\n");
-
-    // Variáveis para armazenar os dados do sensor
-    int16_t accel[3], gyro[3], temp_raw;
-
-    // 3. Loop para coletar e gravar o número de amostras definido
-    for (uint32_t i = 0; i < num_amostras; i++)
+    // Se o arquivo estiver vazio, escreve o cabeçalho
+    if (f_tell(&g_log_file) == 0)
     {
-        // Obtém o tempo da máquina (microssegundos desde o boot)
-        uint64_t timestamp = time_us_64();
-
-        // Lê os dados brutos do sensor MPU6050
-        mpu6050_read_raw(accel, gyro, &temp_raw);
-
-        // Formata a linha do CSV e a escreve no arquivo
-        f_printf(&fil, "%llu;%d;%d;%d;%d;%d;%d;%d\n",
-                 timestamp,
-                 accel[0], accel[1], accel[2],
-                 gyro[0], gyro[1], gyro[2],
-                 temp_raw);
-
-        // Aguarda o intervalo definido para a próxima amostra
-        sleep_ms(intervalo_ms);
+        f_printf(&g_log_file, "timestamp_us;ax_avg;ay_avg;az_avg;gx_avg;gy_avg;gz_avg;temp_avg\n");
     }
 
-    // 4. Fechar o arquivo para garantir que todos os dados sejam salvos
-    fr = f_close(&fil);
-    if (fr != FR_OK)
+    g_log_ativo = true;
+
+    // Inicia um timer que chamará a 'timer_callback' a cada 10 milissegundos
+    // 10ms * 100 amostras = 1000ms = 1 segundo por linha de dados gravada.
+    add_repeating_timer_ms(-10, timer_callback, NULL, &g_repeating_timer);
+
+    printf(">>> LOG INICIADO. Coletando médias de 100 amostras por segundo...\n");
+}
+
+// Função para PARAR o processo de log
+void parar_log_robusto()
+{
+    if (!g_log_ativo)
     {
-        printf("ERRO: Nao foi possivel fechar o arquivo '%s' (%s)\n", filename, FRESULT_str(fr));
-        return false;
+        printf("Nenhum log ativo para parar.\n");
+        return;
     }
 
-    printf("Gravacao concluida com sucesso no arquivo: %s\n", filename);
-    return true;
+    // Sinaliza para a interrupção do timer parar
+    g_log_ativo = false;
+    // Cancela o timer explicitamente
+    cancel_repeating_timer(&g_repeating_timer);
+
+    // Fecha o arquivo, salvando todos os dados restantes.
+    f_close(&g_log_file);
+
+    printf(">>> LOG PARADO. Arquivo salvo com segurança.\n");
 }
 
 // Função para ler o conteúdo de um arquivo e exibir no terminal
@@ -400,7 +468,9 @@ void read_file(const char *filename)
 
 // Trecho para modo BOOTSEL com botão B
 #include "pico/bootrom.h"
+#define botaoA 5
 #define botaoB 6
+
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
     reset_usb_boot(0, 0);
@@ -417,6 +487,8 @@ static void run_help()
     printf("Digite 'f' para capturar dados do ADC e salvar no arquivo\n");
     printf("Digite 'g' para formatar o cartão SD\n");
     printf("Digite 'h' para exibir os comandos disponíveis\n");
+    printf("Digite 's' para iniciar a gravar dados no cartão sd\n");
+    printf("Digite 'p' para parar de gravar dados no cartão\n");
     printf("\nEscolha o comando:  ");
 }
 
@@ -502,6 +574,7 @@ static void process_stdio(int cRxedChar)
 
 int main()
 {
+
     // Para ser utilizado o modo BOOTSEL com botão B
     gpio_init(botaoB);
     gpio_set_dir(botaoB, GPIO_IN);
@@ -517,84 +590,87 @@ int main()
     printf("\033[2J\033[H"); // Limpa tela
     printf("\n> ");
     stdio_flush();
-    //    printf("A tela foi limpa...\n");
-    //    printf("Depois do Flush\n");
     run_help();
-
     sleep_ms(1000);
 
     printf("Hello, MPU6050! Reading raw data from registers...\n");
 
-    // This example will use I2C0 on the default SDA and SCL pins (4, 5 on a Pico)
     i2c_init(I2C_PORT, 400 * 1000);
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
-    // Make the I2C pins available to picotool
-    printf("Antes do bi_decl...\n");
     bi_decl(bi_2pins_with_func(I2C_SDA, I2C_SCL, GPIO_FUNC_I2C));
+
     printf("Antes do reset MPU...\n");
     mpu6050_reset();
 
-    int16_t acceleration[3], gyro[3], temp;
-
+    // Loop principal
     while (true)
     {
+        // Tarefa 1: Verificar se a interrupção do timer sinalizou que há dados para gravar
+        if (g_dados_prontos_para_gravar)
+        {
+            // Reseta a flag primeiro para não entrar aqui de novo sem querer
+            g_dados_prontos_para_gravar = false;
+
+            // Agora, com calma e fora da interrupção, gravamos os dados médios no arquivo
+            f_printf(&g_log_file, "%llu;%d;%d;%d;%d;%d;%d;%d\n",
+                     time_us_64(),
+                     g_dados_medios[0], g_dados_medios[1], g_dados_medios[2],
+                     g_dados_medios[3], g_dados_medios[4], g_dados_medios[5],
+                     g_dados_medios[6]);
+        }
+
+        // Tarefa 2: Processar comandos do usuário
         int cRxedChar = getchar_timeout_us(0);
-        if (PICO_ERROR_TIMEOUT != cRxedChar)
-            process_stdio(cRxedChar);
+        if (cRxedChar != PICO_ERROR_TIMEOUT)
+        {
+            bool atalho_usado = true;
+            switch (cRxedChar)
+            {
+            case 'a':
+                run_mount();
+                break;
+            case 'b':
+                run_unmount();
+                break;
+            case 'c':
+                run_ls();
+                break;
+            case 'd':
+                read_file(filename);
+                break;
+            case 'e':
+                run_getfree();
+                break;
+            case 'g':
+                run_format();
+                break;
+            case 'h':
+                run_help();
+                break;
+            case 's':
+                iniciar_log_robusto();
+                break; // START
+            case 'p':
+                parar_log_robusto();
+                break; // PARAR
+            default:
+                atalho_usado = false;
+                break;
+            }
 
-        if (cRxedChar == 'a') // Monta o SD card se pressionar 'a'
-        {
-            printf("\nMontando o SD...\n");
-            run_mount();
-            printf("\nEscolha o comando (h = help):  ");
+            if (atalho_usado)
+            {
+                printf("\n> ");
+            }
+            else
+            {
+                // Deixamos o process_stdio aqui caso queira reativar comandos completos no futuro
+                // Mas a lógica de atalhos é a principal agora.
+            }
         }
-        if (cRxedChar == 'b') // Desmonta o SD card se pressionar 'b'
-        {
-            printf("\nDesmontando o SD. Aguarde...\n");
-            run_unmount();
-            printf("\nEscolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'c') // Lista diretórios e os arquivos se pressionar 'c'
-        {
-            printf("\nListagem de arquivos no cartão SD.\n");
-            run_ls();
-            printf("\nListagem concluída.\n");
-            printf("\nEscolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'd') // Exibe o conteúdo do arquivo se pressionar 'd'
-        {
-            read_file(filename);
-            printf("Escolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'e') // Obtém o espaço livre no SD card se pressionar 'e'
-        {
-            printf("\nObtendo espaço livre no SD.\n\n");
-            run_getfree();
-            printf("\nEspaço livre obtido.\n");
-            printf("\nEscolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'f') // Captura dados do ADC e salva no arquivo se pressionar 'f'
-        {
-            gravar_dados_imu(filename, 128, 100);
-
-            printf("\nEscolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'g') // Formata o SD card se pressionar 'g'
-        {
-            printf("\nProcesso de formatação do SD iniciado. Aguarde...\n");
-            run_format();
-            printf("\nFormatação concluída.\n\n");
-            printf("\nEscolha o comando (h = help):  ");
-        }
-        if (cRxedChar == 'h') // Exibe os comandos disponíveis se pressionar 'h'
-        {
-            run_help();
-        }
-
-        sleep_ms(500);
     }
     return 0;
 }
