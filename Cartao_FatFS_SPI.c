@@ -24,12 +24,16 @@
 static bool logger_enabled;
 static const uint32_t period = 1000;
 static absolute_time_t next_log_time;
+static ssd1306_t ssd;
 
 volatile bool cartao_montado = false;
 volatile bool capturando_dados = false;
+volatile bool precisa_atualizar_display = true;
+volatile bool SW_button_pressed = false;
+volatile bool button_A_pressed = false;
 
 static FIL g_log_file;
-static volatile bool g_log_ativo = false; // 'volatile' é importante para flags usadas em interrupções
+static volatile bool g_log_ativo = false;
 static volatile bool g_dados_prontos_para_gravar = false;
 
 // Estrutura para armazenar a média final que será gravada no arquivo
@@ -38,7 +42,38 @@ static int16_t g_dados_medios[7]; // ax, ay, az, gx, gy, gz, temp
 // Estrutura do nosso temporizador
 static repeating_timer_t g_repeating_timer;
 
-static char filename[20] = "adc_data8.csv";
+static char filename[20] = "adc_data11.csv";
+
+void entrar_em_erro_fatal()
+{
+    // 1. Mostra uma mensagem final e clara no display
+    ssd1306_fill(&ssd, false);
+    ssd1306_draw_string(&ssd, "ERRO FATAL!", 20, 24);
+    ssd1306_draw_string(&ssd, "Reinicie o disp.", 0, 40);
+    ssd1306_send_data(&ssd);
+
+    // 2. Entra em um loop infinito que só pisca o LED roxo
+    while (true)
+    {
+        acender_led_rgb(128, 0, 128); // Roxo
+        sleep_ms(200);
+        turn_off_leds();
+        sleep_ms(200);
+    }
+}
+
+void piscar_led_leitura_sd(bool *led_estado)
+{
+    if (*led_estado)
+    {
+        acender_led_rgb(0, 0, 255); // Azul
+    }
+    else
+    {
+        turn_off_leds();
+    }
+    *led_estado = !(*led_estado);
+}
 
 static sd_card_t *sd_get_by_name(const char *const name)
 {
@@ -149,7 +184,10 @@ static void run_mount()
     if (FR_OK != fr)
     {
         printf("f_mount error: %s (%d)\n", FRESULT_str(fr), fr);
-        return;
+        cartao_montado = false;           // Sinaliza o estado de erro
+        precisa_atualizar_display = true; // Força a atualização da tela uma vez
+        entrar_em_erro_fatal();
+        // O código NUNCA passará desta linha
     }
     sd_card_t *pSD = sd_get_by_name(arg1);
     myASSERT(pSD);
@@ -183,6 +221,8 @@ static void run_unmount()
 }
 static void run_getfree()
 {
+    acender_led_rgb(0, 0, 255); // LIGA o LED azul
+
     const char *arg1 = strtok(NULL, " ");
     if (!arg1)
         arg1 = sd_get_by_num(0)->pcName;
@@ -191,17 +231,24 @@ static void run_getfree()
     if (!p_fs)
     {
         printf("Unknown logical drive number: \"%s\"\n", arg1);
+        precisa_atualizar_display = true; // Garante que a interface restaure
         return;
     }
     FRESULT fr = f_getfree(arg1, &fre_clust, &p_fs);
     if (FR_OK != fr)
     {
         printf("f_getfree error: %s (%d)\n", FRESULT_str(fr), fr);
+        precisa_atualizar_display = true; // Garante que a interface restaure
         return;
     }
+
+    // A operação acontece aqui, enquanto o LED está azul
     tot_sect = (p_fs->n_fatent - 2) * p_fs->csize;
     fre_sect = fre_clust * p_fs->csize;
     printf("%10lu KiB total drive space.\n%10lu KiB available.\n", tot_sect / 2, fre_sect / 2);
+
+    sleep_ms(100);                    // Garante que o "flash" seja visível
+    precisa_atualizar_display = true; // Sinaliza para restaurar a interface
 }
 static void run_ls()
 {
@@ -234,26 +281,31 @@ static void run_ls()
     if (FR_OK != fr)
     {
         printf("f_findfirst error: %s (%d)\n", FRESULT_str(fr), fr);
+        precisa_atualizar_display = true;
         return;
     }
+
+    bool led_estado = true; // Variável de controle para o pisca-pisca
     while (fr == FR_OK && fno.fname[0])
     {
-        const char *pcWritableFile = "writable file",
-                   *pcReadOnlyFile = "read only file",
-                   *pcDirectory = "directory";
+        piscar_led_leitura_sd(&led_estado); // Pisca o LED
+        sleep_ms(50);                       // Controla a velocidade do pisca-pisca
+
         const char *pcAttrib;
         if (fno.fattrib & AM_DIR)
-            pcAttrib = pcDirectory;
+            pcAttrib = "directory";
         else if (fno.fattrib & AM_RDO)
-            pcAttrib = pcReadOnlyFile;
+            pcAttrib = "read only file";
         else
-            pcAttrib = pcWritableFile;
+            pcAttrib = "writable file";
         printf("%s [%s] [size=%llu]\n", fno.fname, pcAttrib, fno.fsize);
 
         fr = f_findnext(&dj, &fno);
     }
     f_closedir(&dj);
+    precisa_atualizar_display = true; // Restaura a interface ao final
 }
+
 static void run_cat()
 {
     char *arg1 = strtok(NULL, " ");
@@ -269,14 +321,17 @@ static void run_cat()
         printf("f_open error: %s (%d)\n", FRESULT_str(fr), fr);
         return;
     }
-    char buf[256];
+
+    char buf[128];          // Buffer menor para mais piscadas
+    bool led_estado = true; // Controle do pisca-pisca
     while (f_gets(buf, sizeof buf, &fil))
     {
+        piscar_led_leitura_sd(&led_estado);
         printf("%s", buf);
     }
-    fr = f_close(&fil);
-    if (FR_OK != fr)
-        printf("f_open error: %s (%d)\n", FRESULT_str(fr), fr);
+    f_close(&fil);
+
+    precisa_atualizar_display = true; // Restaura a interface ao final
 }
 
 // MPU6050 I2C address
@@ -412,7 +467,8 @@ void iniciar_log_robusto()
     if (fr != FR_OK)
     {
         printf("ERRO: Nao foi possivel abrir o arquivo '%s' (%s)\n", filename, FRESULT_str(fr));
-        return;
+        entrar_em_erro_fatal(); // << CHAMA A FUNÇÃO DE ERRO AQUI
+        // O código NUNCA passará desta linha
     }
 
     // Se o arquivo estiver vazio, escreve o cabeçalho
@@ -456,6 +512,8 @@ void parar_log_robusto()
 // Função para ler o conteúdo de um arquivo e exibir no terminal
 void read_file(const char *filename)
 {
+    bool led_estado = true; // Variável de controle para o pisca-pisca
+
     FIL file;
     FRESULT res = f_open(&file, filename, FA_READ);
     if (res != FR_OK)
@@ -469,6 +527,7 @@ void read_file(const char *filename)
     printf("Conteúdo do arquivo %s:\n", filename);
     while (f_read(&file, buffer, sizeof(buffer) - 1, &br) == FR_OK && br > 0)
     {
+        piscar_led_leitura_sd(&led_estado);
         buffer[br] = '\0';
         printf("%s", buffer);
     }
@@ -482,29 +541,29 @@ void read_file(const char *filename)
 #define SW_BUTTON 22
 volatile uint32_t last_button_time = 0;
 
+// Coloque esta versão no lugar da sua
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
     uint32_t now_button_time = to_ms_since_boot(get_absolute_time());
 
-    if (now_button_time - last_button_time < 200)
+    if (now_button_time - last_button_time < 250) // Debounce para evitar múltiplos cliques
     {
         return;
     }
     last_button_time = now_button_time;
 
+    // A interrupção APENAS levanta a flag. Nenhuma lógica aqui!
     if (gpio == button_A)
     {
-        printf("Botão A pressionado!\n");
+        button_A_pressed = true;
+    }
+    else if (gpio == SW_BUTTON)
+    {
+        SW_button_pressed = true;
     }
     else if (gpio == button_B)
     {
-        printf("Botão B pressionado!\n");
         reset_usb_boot(0, 0);
-    }
-
-    else if (gpio == SW_BUTTON)
-    {
-        printf("Botão SW pressionado!\n");
     }
 }
 
@@ -604,13 +663,48 @@ static void process_stdio(int cRxedChar)
     }
 }
 
+// Versão simplificada e limpa
+void atualizar_interface(ssd1306_t *ssd, bool cartao_montado, bool capturando_dados)
+{
+    ssd1306_fill(ssd, false); // Limpa a tela
+
+    if (!cartao_montado)
+    {
+        // Estado: Cartão Desmontado (AMARELO)
+        acender_led_rgb(255, 255, 0);
+        ssd1306_draw_string(ssd, "Cartao SD", 28, 16);
+        ssd1306_draw_string(ssd, "Desmontado", 24, 28);
+        ssd1306_draw_string(ssd, "Aperte SW", 28, 44);
+    }
+    else
+    {
+        if (capturando_dados)
+        {
+            // Estado: Capturando (VERMELHO)
+            acender_led_rgb(255, 0, 0);
+            ssd1306_draw_string(ssd, "Capturando...", 16, 16);
+            ssd1306_draw_string(ssd, "Aperte 'A'", 24, 32);
+            ssd1306_draw_string(ssd, "para Parar", 24, 48);
+        }
+        else
+        {
+            // Estado: Pronto (VERDE)
+            acender_led_rgb(0, 255, 0);
+            ssd1306_draw_string(ssd, "Sistema Pronto", 8, 16);
+            ssd1306_draw_string(ssd, "Aperte 'A'", 24, 32);
+            ssd1306_draw_string(ssd, "para Capturar", 8, 48);
+        }
+    }
+
+    ssd1306_send_data(ssd);
+}
+
 int main()
 {
     // display
     i2c_init(I2C_PORT_DISP, 400 * 1000);
     gpio_set_function(I2C_SDA_DISP, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_DISP, GPIO_FUNC_I2C);
-    ssd1306_t ssd;
     ssd1306_init(&ssd, 128, 64, false, endereco, I2C_PORT_DISP);
     ssd1306_config(&ssd);
     ssd1306_fill(&ssd, false);
@@ -671,34 +765,66 @@ int main()
         // Tarefa 1: Verificar se a interrupção do timer sinalizou que há dados para gravar
         if (g_dados_prontos_para_gravar)
         {
-            // Reseta a flag primeiro para não entrar aqui de novo sem querer
             g_dados_prontos_para_gravar = false;
-
-            // Agora, com calma e fora da interrupção, gravamos os dados médios no arquivo
+            // A escrita no cartão acontece aqui
             f_printf(&g_log_file, "%llu;%d;%d;%d;%d;%d;%d;%d\n",
                      time_us_64(),
                      g_dados_medios[0], g_dados_medios[1], g_dados_medios[2],
                      g_dados_medios[3], g_dados_medios[4], g_dados_medios[5],
                      g_dados_medios[6]);
+            f_sync(&g_log_file); // Força a escrita física no cartão (importante!)
+
+            precisa_atualizar_display = true; // <<< SINALIZA PARA A INTERFACE VOLTAR AO NORMAL
         }
 
-        if (cartao_montado == true && capturando_dados == false && g_log_ativo == false)
+        if (SW_button_pressed)
         {
-            acender_led_rgb(0, 255, 0);
-            ssd1306_fill(&ssd, false);
-            ssd1306_draw_string(&ssd, "Sistema pronto", 8, 16);
-            ssd1306_draw_string(&ssd, "para capturar", 12, 28);
-            ssd1306_draw_string(&ssd, "dados", 44, 40);
-            ssd1306_send_data(&ssd);
+            SW_button_pressed = false;        // 1. "Consome" o evento para não repetir a ação
+            cartao_montado = !cartao_montado; // 2. Inverte o estado do cartão
+            precisa_atualizar_display = true; // 3. Sinaliza que a tela precisa mudar
+
+            if (cartao_montado)
+            {
+                run_mount(); // Ação de montar
+            }
+            else
+            {
+                // Se estava capturando, precisa parar ANTES de desmontar
+                if (capturando_dados)
+                {
+                    parar_log_robusto();
+                    capturando_dados = false;
+                    g_log_ativo = false;
+                }
+                run_unmount(); // Ação de desmontar
+            }
         }
-        else if (cartao_montado == false && capturando_dados == false && g_log_ativo == false)
+
+        if (button_A_pressed)
         {
-            acender_led_rgb(255, 255, 51);
-            ssd1306_fill(&ssd, false);
-            ssd1306_draw_string(&ssd, "Cartao SD", 28, 16);
-            ssd1306_draw_string(&ssd, "Desmontado", 24, 28);
-            ssd1306_draw_string(&ssd, "Aguardando...", 16, 40);
-            ssd1306_send_data(&ssd);
+            button_A_pressed = false; // 1. "Consome" o evento
+
+            // Ação só ocorre se o cartão estiver montado
+            if (cartao_montado)
+            {
+                capturando_dados = !capturando_dados; // 2. Inverte o estado da captura
+                precisa_atualizar_display = true;     // 3. Sinaliza que a tela precisa mudar
+
+                if (capturando_dados)
+                {
+                    iniciar_log_robusto();
+                }
+                else
+                {
+                    parar_log_robusto();
+                }
+            }
+        }
+
+        if (precisa_atualizar_display)
+        {
+            atualizar_interface(&ssd, cartao_montado, capturando_dados);
+            precisa_atualizar_display = false;
         }
 
         // Tarefa 2: Processar comandos do usuário
@@ -713,12 +839,14 @@ int main()
                 break;
             case 'b':
                 run_unmount();
+                precisa_atualizar_display = true;
                 break;
             case 'c':
                 run_ls();
                 break;
             case 'd':
                 read_file(filename);
+                precisa_atualizar_display = true;
                 break;
             case 'e':
                 run_getfree();
