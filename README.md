@@ -50,7 +50,7 @@ A interface com o usuário é projetada para ser simples e direta, utilizando o 
 
 Para visualizar os dados coletados, um conjunto de scripts em Python é fornecido.
 
-1.  **`pyserial_transfer.py` (Opcional):**
+1.  **`Python_serial.py`:**
     Este script utilitário se conecta ao Pico via porta serial para extrair o arquivo `.csv` do cartão SD e salvá-lo no seu computador, eliminando a necessidade de um leitor de cartão externo.
 
 2.  **`plot_data.py`:**
@@ -66,5 +66,5 @@ Ambos os gráficos usam o tempo real no eixo X para uma análise precisa.
 pip install pandas matplotlib pyserial
 
 # Execute o script de plotagem
-python plot_data.py
+python PlotaDados.py
 ```
