@@ -422,6 +422,7 @@ void iniciar_log_robusto()
     }
 
     g_log_ativo = true;
+    capturando_dados = true;
 
     // Inicia um timer que chamará a 'timer_callback' a cada 10 milissegundos
     // 10ms * 100 amostras = 1000ms = 1 segundo por linha de dados gravada.
@@ -441,6 +442,8 @@ void parar_log_robusto()
 
     // Sinaliza para a interrupção do timer parar
     g_log_ativo = false;
+    capturando_dados = false;
+
     // Cancela o timer explicitamente
     cancel_repeating_timer(&g_repeating_timer);
 
@@ -639,13 +642,6 @@ int main()
     time_init();
     adc_init();
 
-    printf("FatFS SPI example\n");
-    printf("\033[2J\033[H"); // Limpa tela
-    printf("\n> ");
-    stdio_flush();
-    run_help();
-    sleep_ms(1000);
-
     printf("Hello, MPU6050! Reading raw data from registers...\n");
 
     i2c_init(I2C_PORT, 400 * 1000);
@@ -657,6 +653,14 @@ int main()
 
     printf("Antes do reset MPU...\n");
     mpu6050_reset();
+
+    printf("FatFS SPI example\n");
+    printf("\033[2J\033[H"); // Limpa tela
+    printf("\n> ");
+    stdio_flush();
+    run_help();
+    sleep_ms(1000);
+
     turn_off_leds();
     ssd1306_fill(&ssd, false);
     ssd1306_send_data(&ssd);
@@ -676,6 +680,25 @@ int main()
                      g_dados_medios[0], g_dados_medios[1], g_dados_medios[2],
                      g_dados_medios[3], g_dados_medios[4], g_dados_medios[5],
                      g_dados_medios[6]);
+        }
+
+        if (cartao_montado == true && capturando_dados == false && g_log_ativo == false)
+        {
+            acender_led_rgb(0, 255, 0);
+            ssd1306_fill(&ssd, false);
+            ssd1306_draw_string(&ssd, "Sistema pronto", 8, 16);
+            ssd1306_draw_string(&ssd, "para capturar", 12, 28);
+            ssd1306_draw_string(&ssd, "dados", 44, 40);
+            ssd1306_send_data(&ssd);
+        }
+        else if (cartao_montado == false && capturando_dados == false && g_log_ativo == false)
+        {
+            acender_led_rgb(255, 255, 51);
+            ssd1306_fill(&ssd, false);
+            ssd1306_draw_string(&ssd, "Cartao SD", 28, 16);
+            ssd1306_draw_string(&ssd, "Desmontado", 24, 28);
+            ssd1306_draw_string(&ssd, "Aguardando...", 16, 40);
+            ssd1306_send_data(&ssd);
         }
 
         // Tarefa 2: Processar comandos do usuário
