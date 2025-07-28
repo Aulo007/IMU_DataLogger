@@ -45,7 +45,7 @@ except Exception as e:
     print(f"Ocorreu um erro ao processar o arquivo: {e}")
     exit()
 
-# Plotando o Gráfico do Acelerômetro 
+# Plotando o Gráfico do Acelerômetro
 fig1, eixos_acel = plt.subplots(3, 1, figsize=(15, 9), sharex=True)
 data_coleta = df["tempo_real"].iloc[0].strftime("%d/%m/%Y")
 fig1.suptitle(f"Análise do Acelerômetro - Coleta de {data_coleta}", fontsize=16)

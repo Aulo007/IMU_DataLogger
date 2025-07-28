@@ -28,6 +28,8 @@ add_subdirectory(lib/FatFs_SPI)
 add_executable(${PROJECT_NAME}  
         Cartao_FatFS_SPI.c
         hw_config.c
+        lib/leds.c
+        lib/ssd1306.c
         )
 
     
@@ -38,6 +40,7 @@ target_link_libraries(${PROJECT_NAME}
         hardware_clocks
         hardware_adc
         hardware_i2c
+        hardware_pwm
         )
 
 pico_enable_stdio_usb(${PROJECT_NAME} 1)

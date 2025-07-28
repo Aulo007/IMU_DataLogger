@@ -10,6 +10,8 @@
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
 #include "hardware/i2c.h"
+#include "lib/leds.h"
+#include "lib/ssd1306.h"
 
 #include "ff.h"
 #include "diskio.h"
@@ -281,6 +283,11 @@ static void run_cat()
 #define I2C_PORT i2c0 // i2c0 pinos 0 e 1, i2c1 pinos 2 e 3
 #define I2C_SDA 0     // 0 ou 2
 #define I2C_SCL 1     // 1 ou 3
+// Oi, eu sou o display
+#define I2C_PORT_DISP i2c1
+#define I2C_SDA_DISP 14
+#define I2C_SCL_DISP 15
+#define endereco 0x3C
 
 static int addr = 0x68;
 
@@ -466,14 +473,36 @@ void read_file(const char *filename)
     printf("\nLeitura do arquivo %s concluída.\n\n", filename);
 }
 
-// Trecho para modo BOOTSEL com botão B
 #include "pico/bootrom.h"
-#define botaoA 5
-#define botaoB 6
+#define button_A 5
+#define button_B 6
+#define SW_BUTTON 22
+volatile uint32_t last_button_time = 0;
 
 void gpio_irq_handler(uint gpio, uint32_t events)
 {
-    reset_usb_boot(0, 0);
+    uint32_t now_button_time = to_ms_since_boot(get_absolute_time());
+
+    if (now_button_time - last_button_time < 200)
+    {
+        return;
+    }
+    last_button_time = now_button_time;
+
+    if (gpio == button_A)
+    {
+        printf("Botão A pressionado!\n");
+    }
+    else if (gpio == button_B)
+    {
+        printf("Botão B pressionado!\n");
+        reset_usb_boot(0, 0);
+    }
+
+    else if (gpio == SW_BUTTON)
+    {
+        printf("Botão SW pressionado!\n");
+    }
 }
 
 static void run_help()
@@ -574,12 +603,36 @@ static void process_stdio(int cRxedChar)
 
 int main()
 {
+    // display
+    i2c_init(I2C_PORT_DISP, 400 * 1000);
+    gpio_set_function(I2C_SDA_DISP, GPIO_FUNC_I2C);
+    gpio_set_function(I2C_SCL_DISP, GPIO_FUNC_I2C);
+    ssd1306_t ssd;
+    ssd1306_init(&ssd, 128, 64, false, endereco, I2C_PORT_DISP);
+    ssd1306_config(&ssd);
+    ssd1306_fill(&ssd, false);
+    ssd1306_send_data(&ssd);
 
-    // Para ser utilizado o modo BOOTSEL com botão B
-    gpio_init(botaoB);
-    gpio_set_dir(botaoB, GPIO_IN);
-    gpio_pull_up(botaoB);
-    gpio_set_irq_enabled_with_callback(botaoB, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    ssd1306_draw_string(&ssd, "Iniciando", 28, 24);
+    ssd1306_draw_string(&ssd, "Sistema...", 24, 36);
+    ssd1306_send_data(&ssd);
+    // led
+    led_init();
+    acender_led_rgb(255, 255, 51);
+
+    // iniciando botões
+    gpio_init(button_A);
+    gpio_init(button_B);
+    gpio_init(SW_BUTTON);
+    gpio_set_dir(button_A, GPIO_IN);
+    gpio_pull_up(button_A);
+    gpio_set_dir(button_B, GPIO_IN);
+    gpio_pull_up(button_B);
+    gpio_set_dir(SW_BUTTON, GPIO_IN);
+    gpio_pull_up(SW_BUTTON);
+    gpio_set_irq_enabled_with_callback(button_A, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    gpio_set_irq_enabled_with_callback(button_B, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
+    gpio_set_irq_enabled_with_callback(SW_BUTTON, GPIO_IRQ_EDGE_FALL, true, &gpio_irq_handler);
 
     stdio_init_all();
     sleep_ms(5000);
@@ -604,6 +657,9 @@ int main()
 
     printf("Antes do reset MPU...\n");
     mpu6050_reset();
+    turn_off_leds();
+    ssd1306_fill(&ssd, false);
+    ssd1306_send_data(&ssd);
 
     // Loop principal
     while (true)
