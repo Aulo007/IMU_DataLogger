@@ -42,7 +42,7 @@ static int16_t g_dados_medios[7]; // ax, ay, az, gx, gy, gz, temp
 // Estrutura do nosso temporizador
 static repeating_timer_t g_repeating_timer;
 
-static char filename[20] = "adc_data11.csv";
+static char filename[20] = "adc_data15.csv";
 
 void entrar_em_erro_fatal()
 {
@@ -836,6 +836,7 @@ int main()
             {
             case 'a':
                 run_mount();
+                precisa_atualizar_display = true;
                 break;
             case 'b':
                 run_unmount();
